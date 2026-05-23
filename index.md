@@ -40,7 +40,7 @@ Ingredient label OCR is performed using Google ML Kit, which runs entirely on yo
 
 ## Data transmission security
 
-Data is currently transmitted over HTTP between the app and our backend server. We are in the process of migrating our backend to HTTPS (TLS). This section will be updated when that migration is complete.
+Data transmitted between the app and our backend at `api.sapporosoft.com` is encrypted in transit using HTTPS (TLS), with certificates issued by Let's Encrypt and renewed automatically. Plain HTTP requests to this host are automatically redirected to HTTPS.
 
 ## How we use your information
 
