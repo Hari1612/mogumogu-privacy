@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+# ============================================================================
+# Ship-gate pre-push hook  —  SHIP_AUTH (per-SHA)  +  SHIP_AUTH_BRANCH (windowed)
+# ----------------------------------------------------------------------------
+# Canonical source: tools/ship-auth-pre-push  (version-controlled).
+# Installed to     : $(git rev-parse --git-common-dir)/hooks/pre-push  via
+#                    tools/install-ship-auth-hook.sh   (the hook itself is NOT
+#                    tracked — .git/ is outside the repo tree).
+#
+# Platform branch protection is NOT enforced (private repo, free plan).
+# THIS HOOK IS THE ENFORCEMENT LAYER. Do not disable, do not --no-verify.
+#
+# ── Authorization model (fail-closed: NO grant => push denied) ───────────────
+#   1. SHIP_AUTH          — a single 40-char SHA. If it equals the SHA being
+#                           pushed, the push is allowed (any branch, incl. main).
+#                           This is the ONLY way to push to refs/heads/main.
+#   2. SHIP_AUTH_BRANCH   — "<glob-pattern> <duration>" (e.g. "feature/ret-* 2h").
+#                           Grants push to FEATURE branches whose name matches
+#                           the glob, for <duration> from the file's mtime.
+#                           Duration cap: 8h. NEVER authorizes refs/heads/main.
+#   3. neither matches    — DENY.
+#
+# ── Who may WRITE these tokens ───────────────────────────────────────────────
+#   Only hari (the human ship authority). Workers/agents MUST NOT write
+#   SHIP_AUTH or SHIP_AUTH_BRANCH — doing so is self-authorization and defeats
+#   the gate. See README.md (repo root) and docs/SHIP_AUTH-USAGE.md.
+#
+#   Both token files live in the git-common dir (shared across all worktrees).
+#   Every grant match is appended to SHIP_AUTH_AUDIT.log (grep-able).
+# ============================================================================
+set -u
+
+GIT_COMMON=$(git rev-parse --git-common-dir 2>/dev/null || echo ".git")
+TOKEN="$GIT_COMMON/SHIP_AUTH"
+BRANCH_TOKEN="$GIT_COMMON/SHIP_AUTH_BRANCH"
+AUDIT="$GIT_COMMON/SHIP_AUTH_AUDIT.log"
+MAX_DURATION_SECONDS=28800   # 8h hard cap on any SHIP_AUTH_BRANCH grant
+
+now=$(date +%s)
+
+who() {
+  printf '%s <%s>' \
+    "$(git config user.name 2>/dev/null || echo unknown)" \
+    "$(git config user.email 2>/dev/null || echo unknown)"
+}
+
+# audit  <event>  <sha>  <branch>  <detail>
+audit() {
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" "$3" "$(who)" "$4" \
+    >> "$AUDIT" 2>/dev/null || true
+}
+
+# parse_duration  <token like 30m|2h>  -> seconds on stdout, empty on error
+parse_duration() {
+  local d="$1" num unit
+  num="${d%[mhMH]}"
+  unit="${d: -1}"
+  case "$num" in ''|*[!0-9]*) echo ""; return 1 ;; esac
+  case "$unit" in
+    m|M) echo $(( num * 60 )) ;;
+    h|H) echo $(( num * 3600 )) ;;
+    *)   echo ""; return 1 ;;
+  esac
+}
+
+deny() {
+  echo "" >&2
+  echo "BLOCKED (pre-push): $1" >&2
+  echo "" >&2
+  echo "  No matching SHIP_AUTH or SHIP_AUTH_BRANCH grant." >&2
+  echo "  Authorize in the git-common dir ($GIT_COMMON):" >&2
+  echo "    per-SHA    : write  SHIP_AUTH         = <40-char SHA>          (REQUIRED for main)" >&2
+  echo "    per-branch : write  SHIP_AUTH_BRANCH  = <glob-pattern> <dur>   (feature branches only, <=8h)" >&2
+  echo "                 e.g.   feature/retention-*  2h" >&2
+  echo "  Only hari writes these. Workers must NOT. --no-verify is forbidden." >&2
+  echo "" >&2
+  exit 1
+}
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  branch="${remote_ref#refs/heads/}"
+  is_main=0
+  [ "$remote_ref" = "refs/heads/main" ] && is_main=1
+
+  # ---- 1. SHIP_AUTH per-SHA (authorizes ANY branch, including main) ----------
+  if [ -f "$TOKEN" ]; then
+    expected=$(tr -d "[:space:]" < "$TOKEN")
+    if [ -n "$expected" ] && [ "$expected" = "$local_sha" ]; then
+      audit "ALLOW-SHA" "$local_sha" "$branch" "SHIP_AUTH exact SHA match"
+      continue
+    fi
+  fi
+
+  # ---- main ALWAYS requires per-SHA SHIP_AUTH; branch grants never apply ------
+  if [ "$is_main" = "1" ]; then
+    if [ -f "$TOKEN" ]; then
+      deny "SHIP_AUTH SHA mismatch for main (token expects $(tr -d '[:space:]' < "$TOKEN"), push is $local_sha)."
+    fi
+    deny "push to refs/heads/main requires a per-SHA SHIP_AUTH token."
+  fi
+
+  # ---- 2. SHIP_AUTH_BRANCH windowed grant (FEATURE branches only) ------------
+  if [ -f "$BRANCH_TOKEN" ]; then
+    read -r pattern duration _rest < "$BRANCH_TOKEN"
+    dur_s=$(parse_duration "${duration:-}")
+    if [ -z "${pattern:-}" ] || [ -z "$dur_s" ]; then
+      deny "SHIP_AUTH_BRANCH is malformed ('$(head -1 "$BRANCH_TOKEN")'); expected '<glob-pattern> <duration>' e.g. 'feature/ret-* 2h'."
+    fi
+    if [ "$dur_s" -gt "$MAX_DURATION_SECONDS" ]; then
+      audit "REJECT-CAP" "$local_sha" "$branch" "duration ${duration} exceeds 8h cap"
+      deny "SHIP_AUTH_BRANCH duration '${duration}' exceeds the 8h cap; write a shorter window."
+    fi
+    mtime=$(stat -c %Y "$BRANCH_TOKEN" 2>/dev/null || stat -f %m "$BRANCH_TOKEN" 2>/dev/null || echo 0)
+    age=$(( now - mtime ))
+    if [ "$age" -ge "$dur_s" ]; then
+      rm -f "$BRANCH_TOKEN"
+      audit "EXPIRE-DELETE" "$local_sha" "$branch" "grant '${pattern} ${duration}' expired (age ${age}s >= ${dur_s}s); file removed"
+      deny "SHIP_AUTH_BRANCH grant expired (age ${age}s >= window ${dur_s}s); the stale grant was removed."
+    fi
+    # shellcheck disable=SC2254  # intentional glob match
+    case "$branch" in
+      $pattern)
+        audit "ALLOW-BRANCH" "$local_sha" "$branch" "matched '${pattern}' within ${duration} window (age ${age}s)"
+        continue
+        ;;
+    esac
+    deny "branch '$branch' does not match SHIP_AUTH_BRANCH pattern '${pattern}'."
+  fi
+
+  # ---- 3. no grant of any kind -----------------------------------------------
+  deny "push to '$branch' has no authorization."
+done
+exit 0

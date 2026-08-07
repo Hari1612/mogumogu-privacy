@@ -3,6 +3,15 @@
 Public legal & support pages for **MoguMogu** (by Sapporosoft), served via GitHub Pages
 at <https://hari1612.github.io/mogumogu-privacy/>.
 
+## 🛑 Ship gate — do not self-authorize
+
+Pushing to this repo is gated by the `pre-push` hook (fail-closed: no valid grant
+⇒ push denied). **Only hari writes** `.git/SHIP_AUTH` / `.git/SHIP_AUTH_BRANCH`;
+workers/agents must never write them (self-authorization defeats the gate).
+`main` is per-SHA only; branch grants never authorize `main`; `--no-verify` is
+forbidden. Full usage: [`docs/SHIP_AUTH-USAGE.md`](./docs/SHIP_AUTH-USAGE.md).
+Install/refresh the hook: `bash tools/install-ship-auth-hook.sh`.
+
 ## Canonical pages
 
 | Page | Path | URL |

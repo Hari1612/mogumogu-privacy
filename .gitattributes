@@ -1,0 +1,3 @@
+# Ship-gate shell assets must stay LF so bash parses them on any platform.
+tools/ship-auth-pre-push text eol=lf
+tools/*.sh text eol=lf
